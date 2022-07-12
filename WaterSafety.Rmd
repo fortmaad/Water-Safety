@@ -1,0 +1,445 @@
+---
+author: "Alexander Fortman"
+title: "Predicting Water Safety"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    number_sections: FALSE
+    paged_df: TRUE
+    code_folding: "show"
+    code_download: TRUE
+    theme: yeti
+---
+
+```{r}
+knitr::opts_chunk$set(cache = F, warning = F, message = F)
+```
+
+
+# Introduction
+
+This goal of this project is to predict whether or not water would be safe for human consumption given the following data on water samples:
+  1. pH
+  2, Hardness
+  3. Ability to dissolve minerals
+  4. Chloramines (Disinfectants added to public water systems)
+  5. Sulfate
+  6. Conductivity
+  7. Organic Carbon
+  8. Trihalomethanes ()
+  9. Turbidity (cloudiness and haziness, measure of clarity in light)
+  
+The variable we are predicting is potability which is a binary response (either yes or no).
+  
+The data used for this project is available on [Kaggle](https://www.kaggle.com/adityakadiwal/water-potability). The data was originally uploaded in April of 2021.
+
+Since the dataset I am using is already cleaned, this project will focus primarily on the predictive modeling process for relatively smaller datasets, and will employ classic and machine learning techniques.
+
+
+# Setup
+
+```{r setup}
+if(require(pacman)==FALSE) install.packages("pacman") # package manager
+
+pacman::p_load(tidyverse, magrittr, # general packages
+               DataExplorer, # eda
+               skimr, # eda
+               corrplot, # correlation plot
+               mice, # imputation
+               DT # organized tables
+)
+
+water = read.csv('water_potability.csv')
+
+set.seed(11) # for reproducability
+
+datatable(water)
+```
+
+# Pre-processing
+
+Given the nature of our predictor variables, we will not have to change the datatypes of the predictor variables. We will only need to recode the target variable (Potability) to be a factor (for machine learning algorithms). 0 will indicate that the water is not safe to drink, whereas 1 will show that the water sample was safe to drink.
+
+```{r}
+class(water$Potability)
+water$Potability %<>% as.factor()
+class(water$Potability) # verify that recode worked
+```
+
+```{r}
+water %<>% rename(THM = Trihalomethanes, Safe = Potability)
+```
+
+
+```{r}
+plot_intro(water)
+```
+
+4.4% of our data missing and 61.4% of our observations have no missing values. From this view, it looks like we will be fine to impute the data. Let's take a deeper look into the missing data in the nest section.
+
+# Data Exploration and Processing
+
+```{r}
+plot_missing(water)
+```
+
+Since we have only 5% missing, we will have no issue imputing `THM`. For `pH`, we will also impute. However, since we do not have information regarding the collection of data, we will also add an indicator variable which shows whether or not the THM variable was missing for an observation. For the sake of retaining all possible information, we will impute `Sulfate` although it has nearly a quarter of its data missing. We will also add a missing value indicator for this variable to squeeze as much information from our given dataset.
+
+```{r miss indicators}
+water %<>% mutate(
+  M_ph = ifelse(is.na(water$ph),1,0) %>% as.factor(),
+  M_Sulfate = ifelse(is.na(water$Sulfate),1,0) %>% as.factor()
+)
+```
+
+## Imputation
+
+We will use the [MICE package](https://cran.r-project.org/web/packages/mice/index.html) for imputation, employing the [PMM](https://stefvanbuuren.name/fimd/sec-pmm.html) (predictive mean matching) instead of simple mean or median imputation to hopefully improve prediction power of the models later. 
+
+```{r, results='hide', warning = F}
+imp_data =  mice(data = water, m = 10, method = "pmm", maxit = 5, seed = 11, printFlag = F)
+
+water = mice::complete(imp_data)
+```
+
+
+
+```{r}
+sum(is.na(water)) # verify that imputation worked
+```
+
+## Histograms
+
+```{r}
+plot_histogram(water, ncol = 2, ggtheme = theme_bw())
+```
+
+
+All histograms appear to be good. They are all approximately normal, with `Solids` being right-skewed.
+
+
+```{r}
+prop.table(table(water$Safe)) # proportion of samples that are safe
+```
+
+The proportions for our response variable are balanced. We do not need to use any class balancing techniques.
+
+# Correlation Plot
+
+```{r}
+nums = dplyr::select(water,-c(Safe, M_ph, M_Sulfate))
+pacman::p_load(ggstatsplot, ggcorrplot)
+ggcorrmat(nums, pch = 0, colors = c('gold','white','red'))
+```
+
+Because the predictors do not appear to be correlated and we only have 9 predictors, we will not remove any variables and will proceed with modeling. Below is the dataset we will use for modeling.
+
+## Final Dataframe
+
+```{r}
+water %>% datatable() %>% formatRound(columns = c('ph', 'Hardness', 'Solids', 'Chloramines', 'Sulfate', 'Conductivity', 'Organic_carbon', 'THM', 'Turbidity'), digits = 2)
+```
+
+
+# Modeling
+
+The models I will use are:
+
+  + Stepwise Logistic Regression
+  + Naive Bayes
+  + Linear Support Vector Machine
+  + k-Nearest Neighbors
+  + Random Forest
+  + [XGBoost](https://xgboost.readthedocs.io/en/stable/)
+  + [CatBoost](https://catboost.ai/)
+  + Neural Network
+  
+
+## Setup
+
+Below are all the packages we will need to fit all the models and measure performance:
+
+```{r}
+pacman::p_load(caret, # ml library
+               ROCR,
+               pROC,
+               rpart,
+               ranger,# random forest
+               devtools, # downloading catboost
+               doParallel, # parallel computing
+               e1071, # svm model
+               kernlab, # svm model
+               arm, # naive bayes model
+               nnet
+               )
+
+if(require(catboost)==FALSE) devtools::install_url('https://github.com/catboost/catboost/releases/download/v0.20/catboost-R-Windows-0.20.tgz', INSTALL_opts = c("--no-multiarch", "--no-test-load"))
+pacman::p_load(catboost)
+```
+
+The below function is for clearing parallelization errors.
+
+```{r}
+undoParallel <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list=ls(name=env), pos=env)
+}
+```
+
+
+
+Let's create our training and test sets. Since we're using cross-validation, we will set parameters for that as well.
+
+```{r}
+water$Safe %<>% fct_recode("No" = '0', "Yes" = '1')
+
+trainIndex<-createDataPartition(water$Safe, p=0.9, list=FALSE, times=1)
+cvindx<-createFolds(trainIndex, k=5, returnTrain = TRUE)
+ctrl <- trainControl(method="cv", index=cvindx, summaryFunction = twoClassSummary, classProbs = TRUE)
+
+metric = "ROC"
+
+training = water[trainIndex,] # training
+test = water[-trainIndex,] # test
+t_label = test$Safe
+```
+
+
+
+## Stepwise Logistic Regression
+
+```{r}
+lrstep = train(Safe~., 
+               data=training, 
+               method="glmStepAIC",
+               direction="both", 
+               metric=metric, 
+               trControl=ctrl, 
+               trace=F)
+```
+
+```{r}
+lrstep
+```
+
+
+## Naive Bayes
+
+```{r}
+nb = train(Safe~., 
+           data=training, 
+           method="bayesglm",
+           metric=metric, 
+           trControl=ctrl,
+           trace = F)
+```
+
+```{r}
+nb
+```
+
+## Linear SVM
+
+```{r}
+svm = train(Safe~., 
+             data = training, 
+             method = "svmLinear", 
+             metric = metric,
+             trControl = ctrl,
+             trace = F)
+```
+
+```{r}
+svm
+```
+
+## k-Nearest Neighbors
+
+```{r}
+knnGrid <-  expand.grid(k = c(1:10))
+
+knn = train(Safe~., 
+           data = training,
+           tuneGrid = knnGrid,
+           method = "knn", 
+           metric = metric,
+           trControl = ctrl)
+```
+
+```{r}
+knn
+```
+
+
+## Random Forest
+
+```{r}
+rfGrid <- expand.grid(
+  .mtry = c(6,8,10),
+  .splitrule = c("extratrees","gini"),
+  .min.node.size = c(5)
+)
+```
+
+```{r}
+cl <- makePSOCKcluster(detectCores()-1)
+
+registerDoParallel(cl)
+
+rf = train(Safe~., 
+           tuneGrid=rfGrid,
+           data=training, 
+           method="ranger", 
+           metric=metric, 
+           num.trees=500, 
+           importance="impurity", 
+           trControl=ctrl )
+
+stopCluster(cl)
+```
+
+```{r}
+rf
+```
+
+## XGBoost
+
+```{r}
+xgbGrid <- expand.grid(nrounds = c(100, 200),
+                       max_depth = c(15, 20, 25),
+                       colsample_bytree = seq(0.7, 0.9, length.out = 5),
+                       eta = 0.1,
+                       gamma=0,
+                       min_child_weight = 1,
+                       subsample = 1
+                      )
+```
+
+
+```{r}
+cl = makePSOCKcluster(detectCores()-1)
+
+registerDoParallel(cl)
+
+xgbt <- train(Safe~., 
+              data = training,
+              method = 'xgbTree',
+              metric = metric,
+              tuneGrid = xgbGrid, 
+              trControl = ctrl,
+              verbosity = 0)
+
+stopCluster(cl)
+
+undoParallel()
+```
+
+```{r}
+xgbt
+```
+
+
+## CatBoost
+
+For this model, we will split the training data into its label and predictors.
+
+```{r}
+x = dplyr::select(training, -Safe)
+y = training$Safe
+
+grid_cb <- expand.grid(depth = c(4, 6, 8),
+                    learning_rate = 0.1,
+                    iterations = 100,
+                    l2_leaf_reg = 1e-3,
+                    rsm = 0.95,
+                    border_count = 64)
+```
+
+
+```{r}
+cbt <- train(x, make.names(y),
+                  method = catboost.caret,
+                  metric = metric,
+                  tuneGrid = grid_cb, 
+                  trControl = ctrl,
+                  logging_level = "Silent")
+```
+
+```{r}
+cbt
+```
+
+
+
+## Neural Network
+
+```{r}
+nnetGrid = expand.grid(.size = 1:3,
+                       .decay = seq(from = .01, to = .06, by = .01))
+```
+
+
+```{r}
+cl = makePSOCKcluster(detectCores()-1)
+
+registerDoParallel(cl)
+
+nnet = train(Safe~., 
+           data = training, 
+           method = "nnet", 
+           tuneGrid = nnetGrid,
+           metric = metric,
+           MaxNWts = 100,
+           trControl = ctrl,
+           trace = F)
+
+stopCluster(cl)
+```
+
+```{r}
+nnet
+```
+
+
+# Model Evaluation
+
+```{r}
+models = c('lrstep','nb','svm','knn','rf','xgbt','cbt','nnet')
+accuracy = c()
+auc = c()
+sensitivity = c()
+specificity = c()
+precision = c()
+recall = c()
+```
+
+```{r}
+for (i in models){
+  rocp = predict(eval(as.name(i)), newdata = test, type = "prob")
+  roc = roc(response = test$Safe, predictor = rocp$Yes)
+  auc = append(auc, roc$auc[1])
+  
+  pred = predict(eval(as.name(i)), newdata = test)
+  cm = confusionMatrix(pred, test$Safe)
+  
+  accuracy = append(accuracy, unname(cm$overall[1]))
+  sensitivity = append(sensitivity, unname(cm$byClass['Sensitivity']))
+  specificity = append(specificity, unname(cm$byClass['Specificity']))
+  precision = append(precision, unname(cm$byClass['Precision']))
+  recall = append(recall, unname(cm$byClass['Recall']))
+  
+}
+
+model = c("Stepwise Logistic Regression","Naive Bayes","Linear SVM","k-Nearest Neighbors","Random Forest","XGBoost","Catboost","Neural Network")
+results = data.frame(model, accuracy, auc, sensitivity, specificity, precision, recall)
+```
+
+```{r}
+datatable(results)
+```
+
+
+
+
+
